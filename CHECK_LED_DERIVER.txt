@@ -1,0 +1,49 @@
+`timescale 1ns / 1ps
+
+module CHECK_LED_DERIVER(
+    input clk,
+    input rst_n,
+    
+    input led_en,
+    
+    input [7:0] r_data,
+    input [7:0] w_data,
+    
+    output reg led
+);
+
+parameter LED_PERIOD = 25_000_000;
+
+reg led_start;
+
+always @ (posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        led_start <= 1'd0;
+    end else if(led_en)begin
+        led_start <= 1'd1;
+    end else if(~led_en)begin
+        led_start <= 1'd0;
+    end
+end
+
+reg [24:0] led_cnt;
+
+always @ (posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        led <= 1'd0;
+        led_cnt <= 1'd0;
+    end else if(led_start)begin
+        if(w_data == r_data)begin
+            led <= 1'd1;
+        end else begin
+            if(led_cnt == LED_PERIOD - 1'd1)begin
+                led <= ~led;
+                led_cnt <= 1'd0;
+            end else begin
+                led_cnt <= led_cnt + 1'd1;
+            end
+        end
+    end
+end
+    
+endmodule
