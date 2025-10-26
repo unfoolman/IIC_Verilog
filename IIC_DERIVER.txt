@@ -1,791 +1,356 @@
 `timescale 1ns / 1ps
 
-module IIC(
-    input clk,
-    input rst_n,
+module iic_driver #(
+    parameter  DEF_SYS_CLK = 50_000_000,
+                DEF_IIC_CLK = 100_000,
+                SLAVE_ADDR = 1010_000
+)(
+    input sys_clk,
+    input sys_rst_n,
     
-    input [6:0] slave_addr,                 //从机器件地址
-    input sel_rh_wl,                        //选择读写位
-    input [7:0] slave_inaddr,                           //从机内部地址
-    input iic_exec,                         //IIC起始标志位
+    input w_en,
+    input r_en,
     
-    input sel_speed,                        //设置输出IIC时钟速度:400KHZ : 1'd1 / 100KHZ : 1'd0
+    input [7:0] word_addr,
+    input [7:0] w_data,
+    output reg [7:0] r_data,
     
-    output reg iic_clk,                     //IIC时钟线
-    inout iic_sda,                          //IIC数据线
+    output reg iic_clk,
+    inout iic_sda,
     
-    output reg iic_done,                    //IIC结束标志位
-    
-    input [7:0] w_data,                           //写入的数据
-    output reg [7:0] r_data                       //读出的数据
+    output reg iic_ack
+    //调试
+    ,
+    output reg [3:0] dcstate
 );
 
-parameter IIC_FREQ_400KHZ = 125;
-parameter IIC_FREQ_100KHZ = 500;
+localparam DEF_CLK_CNT = DEF_SYS_CLK / DEF_IIC_CLK;
+reg [7:0] w_slave_addr_reg;
+reg [7:0] r_slave_addr_reg;
 
-//根据输入的速度，设置一个寄存器周期
-reg [11:0] iic_freq;
+always @(*)begin
+    if(w_en)begin
+        w_slave_addr_reg = {SLAVE_ADDR[6:0] , 1'd0};
+    end else if(r_en)begin
+        r_slave_addr_reg = {SLAVE_ADDR[6:0] , 1'd1};
+    end
+end
 
-always @ (*)begin
-    case(sel_speed)
-        1'd1 : iic_freq = IIC_FREQ_400KHZ;
-        1'd0 : iic_freq = IIC_FREQ_100KHZ;
-        default : iic_freq = IIC_FREQ_100KHZ;
+//生成iic时钟
+reg [8:0] clk_cnt;
+always @(posedge sys_clk or negedge sys_rst_n)begin
+    if(!sys_rst_n)begin
+        clk_cnt <= 9'd0;
+    end else if(w_en || r_en)begin
+        if(clk_cnt < DEF_CLK_CNT)begin
+            clk_cnt <= clk_cnt + 1'd1;
+        end else begin
+            clk_cnt <= 9'd0;
+        end
+    end else begin
+        clk_cnt <= 9'd0;
+    end
+end
+
+always @(posedge sys_clk or negedge sys_rst_n)begin
+    if(!sys_rst_n)begin
+        iic_clk <= 1'd1;
+    end else if((clk_cnt == DEF_CLK_CNT / 2)||(clk_cnt == DEF_CLK_CNT))begin
+        iic_clk <= ~iic_clk;
+    end else if(~w_en && ~r_en)begin
+        iic_clk <= 1'd1;
+    end
+end
+
+wire iic_clk_hs;
+wire iic_clk_hc;
+wire iic_clk_ls;
+wire iic_clk_lc;
+
+assign iic_clk_hs = (clk_cnt == 9'd1);      //1
+assign iic_clk_hc = (clk_cnt == (DEF_CLK_CNT / 4 + 9'd1));      //126
+assign iic_clk_ls = (clk_cnt == (DEF_CLK_CNT / 2 + 9'd1));      //251
+assign iic_clk_lc = (clk_cnt == (DEF_CLK_CNT / 4 * 3 + 9'd1));  //376
+
+reg sda_out;
+reg sda_link;
+assign iic_sda = sda_link ? sda_out : 1'dz;
+
+reg [3:0] dnstate;
+
+reg [2:0] bit_cnt;
+
+localparam  IDLE = 4'd0;
+localparam  DSTATE = 4'd1;
+localparam  DSLAVE_ADDR = 4'd2;
+localparam  DACK1 = 4'd3;
+localparam  DWORD_ADDR = 4'd4;
+localparam  DACK2 = 4'd5;
+localparam  DWDATA = 4'd6;
+localparam  DACK3 = 4'd7;
+localparam  DRSTATE = 4'd8;
+localparam  DRSLAVE_ADDR = 4'd9;
+localparam  DACK4 = 4'd10;
+localparam  DRDATA = 4'd11;
+localparam  DACK5 = 4'd12;
+localparam  DSTOP = 4'd13;
+            
+always @(posedge sys_clk or negedge sys_rst_n)begin
+    if(!sys_rst_n)begin
+        dcstate <= IDLE;
+    end else begin
+        dcstate <= dnstate;
+    end
+end
+
+always @(dcstate or dnstate or iic_clk_hs or iic_clk_hc or iic_clk_ls or iic_clk_lc or w_en or r_en)begin
+    case(dcstate)
+        IDLE : begin
+            if(iic_clk_hs)begin
+                dnstate <= DSTATE;
+            end else begin
+                dnstate <= IDLE;
+            end
+        end
+        DSTATE : begin
+            if(iic_clk_ls)begin
+                dnstate <= DSLAVE_ADDR;
+            end else begin
+                dnstate <= DSTATE;
+            end
+        end
+        DSLAVE_ADDR : begin
+            if(iic_clk_lc && (bit_cnt == 3'd0))begin
+                dnstate <= DACK1;
+            end else begin
+                dnstate <= DSLAVE_ADDR;
+            end
+        end
+        DACK1 : begin
+            if(iic_clk_ls && (bit_cnt == 3'd7))begin
+                dnstate <= DWORD_ADDR;
+            end else begin
+                dnstate <= DACK1;
+            end
+        end
+        DWORD_ADDR : begin
+            if(iic_clk_lc && (bit_cnt == 3'd0))begin
+                dnstate <= DACK2;
+            end else begin
+                dnstate <= DWORD_ADDR;
+            end
+        end
+        DACK2 : begin
+            if(iic_clk_ls && (bit_cnt == 3'd7))begin
+                if(w_en)begin
+                    dnstate <= DWDATA;
+                end else if(r_en)begin
+                    dnstate <= DRSTATE;
+                end
+            end else begin
+                dnstate <= DACK2;
+            end
+        end
+        DWDATA : begin
+            if(iic_clk_lc && (bit_cnt == 3'd0))begin
+                dnstate <= DACK3;
+            end else begin
+                dnstate <= DWDATA;
+            end
+        end
+        DACK3 : begin
+            if(iic_clk_ls && (bit_cnt == 3'd7))begin
+                dnstate <= DSTOP;
+            end else begin
+                dnstate <= DACK3;
+            end
+        end
+        DRSTATE : begin
+            if(iic_clk_hc)begin
+                dnstate <= DRSLAVE_ADDR;
+            end else begin
+                dnstate <= DRSTATE;
+            end
+        end
+        DRSLAVE_ADDR : begin
+            if(iic_clk_lc && (bit_cnt == 3'd0))begin
+                dnstate <= DACK4;
+            end else begin
+                dnstate <= DRSLAVE_ADDR;
+            end
+        end
+        DACK4 : begin
+            if(iic_clk_ls && (bit_cnt == 3'd7))begin
+                dnstate <= DRDATA;
+            end else begin
+                dnstate <= DACK4;
+            end
+        end
+        DRDATA : begin
+            if(iic_clk_ls && (bit_cnt == 3'd0))begin
+                dnstate <= DACK5;
+            end else begin
+                dnstate <= DRDATA;
+            end
+        end
+        DACK5 : begin
+            if(iic_clk_ls && (bit_cnt == 3'd6))begin
+                dnstate <= DSTOP;
+            end else begin
+                dnstate <= DACK5;
+            end
+        end
+        DSTOP : begin
+            if(iic_clk_hc)begin
+                dnstate <= IDLE;
+            end else begin
+                dnstate <= DSTOP;
+            end
+        end
+        default : begin
+            dnstate <= IDLE;
+        end
     endcase
 end
 
-//获取起始信号上升沿和下降沿
-reg iic_exec_d0;
-reg iic_exec_d1;
-
-wire iic_exec_posedge;
-wire iic_exec_negedeg;
-
-always @ (posedge clk or negedge rst_n)begin
-    if(!rst_n)begin
-        iic_exec_d0 <= 1'd0;
-        iic_exec_d1 <= 1'd0;
+always @(posedge sys_clk or negedge sys_rst_n)begin
+    if(!sys_rst_n)begin
+        bit_cnt <= 3'd0;
     end else begin
-        iic_exec_d0 <= iic_exec;
-        iic_exec_d1 <= iic_exec_d0;
-    end
-end
-
-assign iic_exec_posedge = ((~iic_exec_d1) && (iic_exec_d0));            //获取起始位上升沿
-assign iic_exec_negedeg = ((iic_exec_d1) && (~iic_exec_d0));            //获取起始位下降沿
-
-
-//设置起始和终止标志位
-
-reg start_flag;         //起始标志
-reg stop_flag;          //停止标志
-
-always @ (posedge clk or negedge rst_n)begin
-    if(!rst_n)begin
-        start_flag <= 1'd0;
-        stop_flag <= 1'd0;
-    end else if(iic_exec_posedge)begin
-        start_flag <= 1'd1;
-        stop_flag <= 1'd0;
-    end else if(iic_exec_negedeg)begin
-        start_flag <= 1'd0;
-        stop_flag <= 1'd1;
-    end
-end
-
-//设置输出的IIC时钟频率
-reg [11:0] iic_clk_cnt;
-
-always @ (posedge clk or negedge rst_n)begin
-    if(!rst_n)begin
-        iic_clk <= 1'd1;
-        iic_clk_cnt <= 12'd0;
-    end else begin
-        if(start_flag)begin
-            if(iic_clk_cnt < iic_freq - 1'd1)begin
-                iic_clk_cnt <= iic_clk_cnt + 1'd1;
-            end else begin
-                iic_clk <= ~iic_clk;
-                iic_clk_cnt <= 1'd0;
-            end
-        end else if(stop_flag)begin                  //空闲时，保持高电平
-            iic_clk <= 1'd1;
-            iic_clk_cnt <= 12'd0;
-        end
-    end
-end
-
-//分段IIC周期
-reg u_iic_clk;                  //反状态
-
-always @ (posedge clk or negedge rst_n)begin
-    if(!rst_n)begin
-        u_iic_clk <= 1'd0;      //反状态初始值设置为0
-    end else if(start_flag)begin
-        if(iic_clk_cnt == iic_freq - 1'd1)begin
-            u_iic_clk <= ~u_iic_clk;
-        end else begin
-            u_iic_clk <= u_iic_clk;
-        end
-    end else if(stop_flag)begin         //反状态空闲时，保持低电平
-        u_iic_clk <= 1'd0;
-    end
-end
-
-wire iic_clk_phf;
-wire iic_clk_phm;
-wire iic_clk_plf;
-wire iic_clk_plm;
-
-assign iic_clk_phf = ((iic_clk) && (~u_iic_clk) && (iic_clk_cnt == 1'd1));                   //IIC时钟周期高电平前沿
-assign iic_clk_phm = ((iic_clk) && (~u_iic_clk) && (iic_clk_cnt == iic_freq / 2 - 1'd1));                   //IIC时钟周期高电平中间时刻
-assign iic_clk_plf = ((~iic_clk) && (u_iic_clk) && (iic_clk_cnt == 1'd1));                   //IIC时钟周期低电平前沿
-assign iic_clk_plm = ((~iic_clk) && (u_iic_clk) && (iic_clk_cnt == iic_freq / 2 - 1'd1));                   //IIC时钟周期低电平中间时刻
-
-//三态门
-reg sda_dri;
-reg sda_out;
-wire sda_in;
-
-assign iic_sda = sda_dri ? sda_out : 1'dz;
-assign sda_in = iic_sda;
-
-//状态机
-reg [4:0] state;
-
-parameter IDLE = 5'd0;
-parameter START_1 = 5'd1;
-parameter START_2 = 5'd2;
-parameter SLAVE_ADDR_1 = 5'd3;
-parameter ACK_ADDR_1 = 5'd4;
-parameter SLAVE_INADDR = 5'd5;
-parameter ACK_INADDR = 5'd6;
-parameter W_DATA = 5'd7;
-parameter ACK_W_DATA = 5'd8;
-parameter RESET_START_1 = 5'd9;
-parameter RESET_START_2 = 5'd10;
-parameter RESET_START_3 = 5'd11;
-parameter SLAVE_ADDR_2 = 5'd12;
-parameter ACK_ADDR_2 = 5'd13;
-parameter R_DATA = 5'd14;
-parameter ACK_R_DATA = 5'd15;
-parameter STOP_1 = 5'd16;
-parameter STOP_2 = 5'd17;
-parameter WAIT = 5'd18;
-
-reg [7:0] shift_reg;        //移位寄存器
-reg [4:0] bit_cnt;          //位记录
-
-reg error;                  //错误标志位
-
-reg once_reg;               //标志转移一次
-
-
-//状态机状态转移未写
-always @ (posedge clk or negedge rst_n)begin
-    if(!rst_n)begin
-        state <= IDLE;
-    end else begin
-        case(state)
-            IDLE : begin
-                if(start_flag)begin
-                    state <= START_1;
-                end
-            end    
-            START_1 : begin
-                if(iic_clk_plm)begin
-                    state <= START_2;
-                end
-            end  
-            START_2 : begin
-                if(iic_clk_phf)begin
-                    state <= SLAVE_ADDR_1;
-                end
-            end 
-            SLAVE_ADDR_1 : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        state <= ACK_ADDR_1;
-                    end
+        case(dcstate)
+            DSTATE , DRSTATE : begin
+                if(iic_clk_hc)begin
+                    bit_cnt <= 3'd7;
                 end
             end
-            ACK_ADDR_1 : begin
-                if(iic_clk_phm)begin
-                    if(sda_in)begin
-                        state <= STOP_1;
-                    end
-                end else if(iic_clk_plf)begin                   //如果没问题就得走完一个时钟周期再转移
-                    if(once_reg)begin
-                        state <= SLAVE_INADDR;
-                    end
-                end
-            end 
-            SLAVE_INADDR : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        state <= ACK_INADDR;
-                    end
+            DSLAVE_ADDR , DWORD_ADDR , DWDATA , DRSLAVE_ADDR: begin
+                if(iic_clk_hc && (bit_cnt > 3'd0))begin
+                    bit_cnt <= bit_cnt - 1'd1;
                 end
             end
-            ACK_INADDR : begin
-                if(iic_clk_phm)begin
-                    if(sda_in)begin
-                        state <= STOP_1;
-                    end
-                end else if(iic_clk_plf)begin
-                    if(once_reg)begin
-                        state <= sel_rh_wl ? RESET_START_1 : W_DATA;
-                    end
-                end
-            end 
-            W_DATA : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        state <= ACK_W_DATA;
-                    end
+            DACK1 , DACK2 , DACK3 , DACK4 : begin
+                if(iic_clk_hc && (~sda_link))begin
+                    bit_cnt <= 3'd7;
                 end
             end
-            ACK_W_DATA : begin
-                if(iic_clk_phm)begin
-                    if(sda_in)begin
-                        state <= STOP_1;
-                    end
-                end else if(iic_clk_plf)begin
-                    if(once_reg)begin
-                        state <= STOP_1;
-                    end
-                end
-            end 
-            RESET_START_1 : begin
-                if(iic_clk_plm)begin
-                    state <= RESET_START_2;
+            DRDATA : begin
+                if(iic_clk_ls)begin
+                    bit_cnt <= bit_cnt - 1'd1;
                 end
             end
-            RESET_START_2 : begin
-                if(iic_clk_phm)begin
-                    state <= RESET_START_3;
+            DACK5 : begin
+                if(iic_clk_hc)begin
+                    bit_cnt <= bit_cnt - 1'd1;
                 end
             end
-            RESET_START_3 : begin
-                if(iic_clk_phm)begin
-                    state <= SLAVE_ADDR_2;
-                end
-            end
-            SLAVE_ADDR_2 : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        state <= ACK_ADDR_2;
-                    end
-                end
-            end
-            ACK_ADDR_2 : begin
-                if(iic_clk_phm)begin
-                    if(sda_in)begin
-                        state <= STOP_1;
-                    end
-                end else if(iic_clk_plf)begin
-                    if(once_reg)begin
-                        state <= R_DATA;
-                    end
-                end
-            end
-            R_DATA : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        state <= ACK_R_DATA;
-                    end
-                end
-            end
-            ACK_R_DATA : begin
-                if(iic_clk_plm && (once_reg))begin
-                    state <= STOP_1;
-                end
-            end
-            STOP_1 : begin
-                if(iic_clk_plm)begin
-                    state <= STOP_2;
-                end
-            end
-            STOP_2 : begin
-                if(iic_clk_phm)begin
-                    state <= WAIT;
-                end
-            end
-            WAIT : begin
-                if(iic_exec_posedge)begin                   //把状态卡在wait，直到下一个起始标志位拉高的时候再重新开始
-                    state <= IDLE;
-                end else begin
-                    state <= state;
-                end
-            end 
         endcase
     end
 end
 
-
-//三态门寄存器状态变换（还没补充完整）
-always @ (posedge clk or negedge rst_n)begin
-    if(!rst_n)begin
-        sda_dri <= 1'd1;                    //让其在复位时刻就是高电平
-    end else if(start_flag)begin
-        case(state)
-            IDLE : begin
-                if(start_flag)begin
-                    sda_dri <= 1'd1;
-                end
-            end    
-            START_1 : begin
-                if(iic_clk_plm)begin
-                    sda_dri <= 1'd1;
-                end
-            end  
-            START_2 : begin
-                if(iic_clk_phf)begin
-                    sda_dri <= 1'd1;
-                end
-            end 
-            SLAVE_ADDR_1 : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        sda_dri <= 1'd0;
-                    end
-                end
-            end
-            ACK_ADDR_1 : begin
-                if(iic_clk_phm)begin
-                    if(sda_in)begin
-                        sda_dri <= 1'd1;
-                    end
-                end else if(iic_clk_plf)begin
-                    if(once_reg)begin
-                        sda_dri <= 1'd1;
-                    end
-                end
-            end
-            SLAVE_INADDR : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        sda_dri <= 1'd0;
-                    end
-                end
-            end 
-            ACK_INADDR : begin
-               if(iic_clk_phm)begin
-                   if(sda_in)begin
-                       sda_dri <= 1'd1;
-                   end
-               end else if(iic_clk_plf)begin
-                   if(once_reg)begin
-                        sda_dri <= 1'd1;
-                    end
-               end
-            end
-            W_DATA : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        sda_dri <= 1'd0;
-                    end
-                end
-            end 
-            ACK_W_DATA : begin
-                if(iic_clk_phm)begin
-                   if(sda_in)begin
-                       sda_dri <= 1'd1;
-                   end
-               end else if(iic_clk_plf)begin
-                   if(once_reg)begin
-                       sda_dri <= 1'd1;
-                   end
-               end
-            end 
-            RESET_START_1 : begin
-                if(iic_clk_plm)begin
-                    sda_dri <= 1'd1;
-                end
-            end 
-            RESET_START_2 : begin
-                if(iic_clk_phm)begin
-                    sda_dri <= 1'd1;
-                end
-            end 
-            RESET_START_3 : begin
-                if(iic_clk_phm)begin
-                    sda_dri <= 1'd1;
-                end
-            end
-            SLAVE_ADDR_2 : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        sda_dri <= 1'd0;
-                    end
-                end
-            end 
-            ACK_ADDR_2 : begin
-                if(iic_clk_phm)begin
-                    if(sda_in)begin
-                        sda_dri <= 1'd1;
-                    end
-                end else if(iic_clk_plf)begin
-                    if(once_reg)begin
-                        sda_dri <= 1'd0;
-                    end
-                end
-            end 
-            R_DATA : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        sda_dri <= 1'd1;
-                    end
-                end
-            end 
-            ACK_R_DATA : begin
-                if(iic_clk_plm && (once_reg))begin
-                    sda_dri <= 1'd1;                    //ACK
-                end
-            end 
-            STOP_1 : begin
-                if(iic_clk_plm)begin
-                    sda_dri <= 1'd1;
-                end
-            end 
-            STOP_2 : begin
-                if(iic_clk_phm)begin
-                    sda_dri <= 1'd1;
-                end
-            end
-            WAIT : begin
-                if(iic_exec_posedge)begin
-                    sda_dri <= 1'd1;
-                end else begin
-                    sda_dri <= 1'd1;
-                end
-            end  
-        endcase
-    end else if(stop_flag)begin             //空闲时刻也为高电平
-        sda_dri <= 1'd1;
-    end
-end
-
-
-//状态机状态内部逻辑未写
-
-always @(posedge clk or negedge rst_n)begin
-    if(!rst_n)begin
-        sda_out <= 1'd1;                    //复位时保持高电平
-    
-        shift_reg <= 8'd0;
-        bit_cnt <= 4'd0;
-        
-        error <= 1'd0;
-        
-        iic_done <= 1'd0;
+always @(posedge sys_clk or negedge sys_rst_n)begin
+    if(!sys_rst_n)begin
+        sda_link <= 1'd1;
+        sda_out <= 1'd1;
         
         r_data <= 8'd0;
-        
-        once_reg <= 1'd0;
     end else begin
-        case(state)
+        case(dcstate)
             IDLE : begin
                 sda_out <= 1'd1;
-    
-                shift_reg <= 8'd0;
-                bit_cnt <= 4'd0;
-    
-                error <= 1'd0;
-                
-                iic_done <= 1'd0;
-            end    
-            START_1 : begin
-                if(iic_clk_plm)begin
+                sda_link <= 1'd1;
+            end
+            DSTATE : begin
+                if(iic_clk_hc)begin
+                    sda_out <= 1'd0;
+                end
+            end
+            DSLAVE_ADDR : begin
+/**/            if(iic_clk_lc)begin
+                    sda_link <= 1'd1;
+                    sda_out <= w_slave_addr_reg[bit_cnt];
+                end
+            end
+            DACK1 : begin
+                if(iic_clk_ls)begin
+                    sda_link <= 1'd0;
                     sda_out <= 1'd1;
-    
-                    shift_reg <= 8'd0;
-                    bit_cnt <= 4'd0;
-    
-                    error <= 1'd0;
-                    
-                    iic_done <= 1'd0;
-                end
-            end 
-            START_2 : begin
-                if(iic_clk_phf)begin
-                    sda_out <= 1'd0;                    //产生起始位
-    
-                    shift_reg <= {slave_addr[6:0] , 1'd0};
-                    bit_cnt <= 4'd8;
-    
-                    error <= 1'd0;
-                    
-                    iic_done <= 1'd0;
-                end
-            end 
-            SLAVE_ADDR_1 : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt > 4'd0)begin
-                        sda_out <= shift_reg[7];
-                        
-                        shift_reg <= {shift_reg[6:0] , 1'd0};
-                        bit_cnt <= bit_cnt - 1'd1;
-                        
-                        error <= 1'd0;
-                    end else if(bit_cnt == 4'd0)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= 8'd0;
-                        bit_cnt <= 4'd0;
-    
-                        error <= 1'd0;
-                    end
-                end
-            end 
-            ACK_ADDR_1 : begin
-                if(iic_clk_phm)begin
-                    once_reg <= 1'd1;
-                    if(sda_in)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= 8'd0;
-                        bit_cnt <= 4'd0;
-    
-                        error <= 1'd1;
-                        
-                        once_reg <= 1'd0;
-                    end
-                end else if(iic_clk_plf)begin
-                    if(once_reg)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= slave_inaddr;
-                        bit_cnt <= 4'd8;
-    
-                        error <= 1'd0;
-                        
-                        once_reg <= 1'd0;
-                    end
                 end
             end
-            SLAVE_INADDR : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt > 4'd0)begin
-                        sda_out <= shift_reg[7];
-                        
-                        shift_reg <= {shift_reg[6:0] , 1'd0};
-                        bit_cnt <= bit_cnt - 1'd1;
-                        
-                        error <= 1'd0;
-                    end else if(bit_cnt == 4'd0)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= 8'd0;
-                        bit_cnt <= 4'd0;
-    
-                        error <= 1'd0;
-                    end
+            DWORD_ADDR : begin
+                if(iic_clk_lc)begin
+                    sda_link <= 1'd1;
+                    sda_out <= word_addr[bit_cnt];
                 end
             end
-            ACK_INADDR : begin
-                if(iic_clk_phm)begin
-                    once_reg <= 1'd1;
-                    if(sda_in)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= 8'd0;
-                        bit_cnt <= 4'd0;
-    
-                        error <= 1'd1;
-                        
-                        once_reg <= 1'd0;
-                    end
-                end else if(iic_clk_plf)begin
-                    if(once_reg)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= sel_rh_wl ? 8'd0 : w_data;
-                        bit_cnt <= 4'd8;
-    
-                        error <= 1'd0;
-                        
-                        once_reg <= 1'd0;
-                    end
-                end
-            end
-            W_DATA : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt > 4'd0)begin
-                        sda_out <= shift_reg[7];
-                        
-                        shift_reg <= {shift_reg[6:0] , 1'd0};
-                        bit_cnt <= bit_cnt - 1'd1;
-                        
-                        error <= 1'd0;
-                    end else if(bit_cnt == 4'd0)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= 8'd0;
-                        bit_cnt <= 4'd0;
-    
-                        error <= 1'd0;
-                    end
-                end
-            end 
-            ACK_W_DATA : begin
-                if(iic_clk_phm)begin
-                    once_reg <= 1'd1;
-                    if(sda_in)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= 8'd0;
-                        bit_cnt <= 4'd0;
-    
-                        error <= 1'd1;
-                        
-                        once_reg <= 1'd0;
-                    end
-                end else if(iic_clk_plf)begin
-                    if(once_reg)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= 8'd0;
-                        bit_cnt <= 4'd0;
-    
-                        error <= 1'd0;
-                        
-                        once_reg <= 1'd0;
-                    end
-                end
-            end
-            RESET_START_1 : begin
-                if(iic_clk_plm)begin
-                    sda_out <= 1'd0;
-    
-                    shift_reg <= 8'd0;
-                    bit_cnt <= 4'd0;
-
-                    error <= 1'd0;
-                end
-            end
-            RESET_START_2 : begin
-                if(iic_clk_phm)begin
+            DACK2 : begin
+                if(iic_clk_ls)begin
+                    sda_link <= 1'd0;
                     sda_out <= 1'd1;
-    
-                    shift_reg <= 8'd0;
-                    bit_cnt <= 4'd0;
-
-                    error <= 1'd0;
                 end
-            end 
-            RESET_START_3 : begin
-                if(iic_clk_phm)begin
+            end
+            DWDATA : begin
+                if(iic_clk_lc)begin
+                    sda_link <= 1'd1;
+                    sda_out <= w_data[bit_cnt];
+                end
+            end
+            DACK3 : begin
+                if(iic_clk_ls)begin
+                    sda_link <= 1'd0;
+                    sda_out <= 1'd1;
+                end
+            end
+            DRSTATE : begin
+                if(iic_clk_lc)begin
+                    sda_link <= 1'd1;
+                    sda_out <= 1'd1;
+                end else if(iic_clk_hs)begin
                     sda_out <= 1'd0;
-    
-                    shift_reg <= {slave_addr[6:0] , 1'd1};
-                    bit_cnt <= 4'd8;
-
-                    error <= 1'd0;
-                end
-            end 
-            SLAVE_ADDR_2 : begin
-                if(iic_clk_plm)begin
-                    if(bit_cnt > 4'd0)begin
-                        sda_out <= shift_reg[7];
-                        
-                        shift_reg <= {shift_reg[6:0] , 1'd0};
-                        bit_cnt <= bit_cnt - 1'd1;
-                        
-                        error <= 1'd0;
-                    end else if(bit_cnt == 4'd0)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= 8'd0;
-                        bit_cnt <= 4'd0;
-    
-                        error <= 1'd0;
-                    end
                 end
             end
-            ACK_ADDR_2 : begin
-                if(iic_clk_phm)begin
-                    once_reg <= 1'd1;
-                    if(sda_in)begin
-                        sda_out <= 1'd0;
-    
-                        shift_reg <= 8'd0;
-                        bit_cnt <= 4'd0;
-    
-                        error <= 1'd1;
-                        
-                        once_reg <= 1'd0;
-                    end
-                end else if(iic_clk_plf)begin
-                    if(once_reg)begin
-                        sda_out <= 1'd1;
-    
-                        shift_reg <= 8'd0;
-                        bit_cnt <= 4'd8;
-    
-                        error <= 1'd0;
-                        
-                        once_reg <= 1'd0;
-                    end
+            DRSLAVE_ADDR : begin
+                if(iic_clk_lc)begin
+                    sda_link <= 1'd1;
+                    sda_out <= r_slave_addr_reg[bit_cnt];
                 end
             end
-            R_DATA : begin
-                if(iic_clk_phm)begin
-                    if(bit_cnt > 4'd0)begin
-                        sda_out <= 1'd1;
-    
-                        shift_reg <= {shift_reg[6:0] , sda_in};
-                        bit_cnt <= bit_cnt - 1'd1;
-    
-                        error <= 1'd0;
-                    end
-                 end else if(iic_clk_plm)begin
-                    if(bit_cnt == 4'd0)begin
-                        sda_out <= 1'd1;
-    
-                        r_data <= shift_reg;
-                        bit_cnt <= 4'd0;
-    
-                        error <= 1'd0;
-                    end
+            DACK4 : begin
+                if(iic_clk_ls)begin
+                    sda_link <= 1'd0;
+                    sda_out <= 1'd1;
                 end
-            end 
-            ACK_R_DATA : begin
-                if(iic_clk_plf && (~once_reg))begin
-                    sda_out <= 1'd1;                    //这里固定发送NACK，放弃连续读操作
-    
-                    shift_reg <= 8'd0;
-                    bit_cnt <= 4'd0;
-
-                    error <= 1'd0;
-                    
-                    once_reg <= 1'd1;
-                end else if(iic_clk_plf && (once_reg))begin
+            end
+            DRDATA : begin
+                if(iic_clk_hc)begin
+                    r_data[bit_cnt] = iic_sda;
+                end
+            end
+            DACK5 : begin
+                if(iic_clk_lc)begin
+                    sda_link <= 1'd1;
+                    sda_out <= 1'd1;
+                end
+            end
+            DSTOP : begin
+                if(iic_clk_lc)begin
+                    sda_link <= 1'd1;
                     sda_out <= 1'd0;
-    
-                    shift_reg <= 8'd0;
-                    bit_cnt <= 4'd0;
-
-                    error <= 1'd0;
-                    
-                    once_reg <= 1'd0;
+                end else if(iic_clk_hs)begin
+                    sda_link <= 1'd1;
+                    sda_out <= 1'd1;
                 end
-            end
-            STOP_1 : begin
-                if(iic_clk_plm)begin
-                    sda_out <= 1'd0;
-                    
-                    shift_reg <= 8'd0;
-                    bit_cnt <= 4'd0;
-
-                    error <= 1'd0;
-                    
-                    iic_done <= 1'd0;
-                end
-            end
-            STOP_2 : begin
-                if(iic_clk_phm)begin
-                    sda_out <= 1'd1;                    //产生结束位
-                    
-                    shift_reg <= 8'd0;
-                    bit_cnt <= 4'd0;
-
-                    error <= 1'd0;
-                    
-                    iic_done <= 1'd1;
-                end
-            end 
-            WAIT : begin
-                sda_out <= 1'd1;                    //产生结束位
-                
-                shift_reg <= 8'd0;
-                bit_cnt <= 4'd0;
-
-                error <= 1'd0;
-                
-                iic_done <= 1'd0;
             end
         endcase
+    end
+end
+
+always @(posedge sys_clk or negedge sys_rst_n)begin
+    if(!sys_rst_n)begin
+        iic_ack <= 1'd0;
+    end else if((dcstate == DSTOP) && (iic_clk_hc))begin
+        iic_ack <= 1'd1;
+    end else if(dcstate == IDLE)begin
+        iic_ack <= 1'd0;
     end
 end
 
